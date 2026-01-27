@@ -101,7 +101,8 @@ def call_orchestrator(text: str, speaker: str, conversation_id: Optional[str] = 
         response = requests.post(
             f"{ORCHESTRATOR_URL}/api/voice",
             json=payload,
-            timeout=30
+            timeout=30,
+            verify=False  # Jarvis uses self-signed certificate
         )
         if response.status_code == 200:
             result = response.json()
