@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 if TYPE_CHECKING:
     from pymicro_wakeword import MicroWakeWord
     from pyopen_wakeword import OpenWakeWord
+    import pvporcupine
 
     from .entity import ESPHomeEntity, MediaPlayerEntity
     from .entity import ESPHomeEntity, MediaPlayerEntity, ThinkingSoundEntity
@@ -23,6 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 class WakeWordType(str, Enum):
     MICRO_WAKE_WORD = "micro"
     OPEN_WAKE_WORD = "openWakeWord"
+    PORCUPINE = "porcupine"
 
 
 @dataclass
@@ -33,7 +35,7 @@ class AvailableWakeWord:
     trained_languages: List[str]
     wake_word_path: Path
 
-    def load(self) -> "Union[MicroWakeWord, OpenWakeWord]":
+    def load(self, porcupine_access_key: Optional[str] = None) -> "Union[MicroWakeWord, OpenWakeWord, pvporcupine.Porcupine]":
         if self.type == WakeWordType.MICRO_WAKE_WORD:
             from pymicro_wakeword import MicroWakeWord
 
@@ -46,6 +48,26 @@ class AvailableWakeWord:
             setattr(oww_model, "wake_word", self.wake_word)
 
             return oww_model
+
+        if self.type == WakeWordType.PORCUPINE:
+            import pvporcupine
+
+            if not porcupine_access_key:
+                raise ValueError(
+                    f"Porcupine access key required for model {self.id}. "
+                    "Please provide --porcupine-access-key argument."
+                )
+
+            porcupine = pvporcupine.create(
+                access_key=porcupine_access_key,
+                keyword_paths=[str(self.wake_word_path)]
+            )
+
+            # Add metadata for consistency with other engines
+            setattr(porcupine, "id", self.id)
+            setattr(porcupine, "wake_word", self.wake_word)
+
+            return porcupine
 
         raise ValueError(f"Unexpected wake word type: {self.type}")
 
@@ -74,6 +96,7 @@ class ServerState:
     preferences_path: Path
     download_dir: Path
 
+    porcupine_access_key: Optional[str] = None
     media_player_entity: "Optional[MediaPlayerEntity]" = None
     satellite: "Optional[VoiceSatelliteProtocol]" = None
     thinking_sound_entity: "Optional[ThinkingSoundEntity]" = None

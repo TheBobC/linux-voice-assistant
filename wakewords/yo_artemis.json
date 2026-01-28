@@ -1,0 +1,6 @@
+{
+  "type": "porcupine",
+  "wake_word": "Yo Artemis",
+  "model": "yo-artemis.ppn",
+  "trained_languages": ["en"]
+}

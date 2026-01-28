@@ -43,6 +43,7 @@ from aioesphomeapi.model import (
 from google.protobuf import message
 from pymicro_wakeword import MicroWakeWord
 from pyopen_wakeword import OpenWakeWord
+import pvporcupine
 
 from .api_server import APIServer
 from .entity import MediaPlayerEntity
@@ -477,7 +478,9 @@ class VoiceSatelliteProtocol(APIServer):
                     self.state.available_wake_words[wake_word_id] = model_info
 
                 _LOGGER.debug("Loading wake word: %s", model_info.wake_word_path)
-                self.state.wake_words[wake_word_id] = model_info.load()
+                self.state.wake_words[wake_word_id] = model_info.load(
+                    porcupine_access_key=self.state.porcupine_access_key
+                )
 
                 _LOGGER.info("Wake word set: %s", wake_word_id)
                 active_wake_words.add(wake_word_id)
@@ -497,7 +500,7 @@ class VoiceSatelliteProtocol(APIServer):
 
         self.send_messages([VoiceAssistantAudio(data=audio_chunk)])
 
-    def wakeup(self, wake_word: Union[MicroWakeWord, OpenWakeWord]) -> None:
+    def wakeup(self, wake_word: Union[MicroWakeWord, OpenWakeWord, pvporcupine.Porcupine]) -> None:
         if self._timer_finished:
             self._timer_finished = False
             self.state.tts_player.stop()

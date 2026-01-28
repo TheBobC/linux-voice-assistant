@@ -69,6 +69,10 @@ async def main() -> None:
         help="Directory to download custom wake word models, etc.",
     )
     parser.add_argument(
+        "--porcupine-access-key",
+        help="Picovoice access key for Porcupine wake word models (.ppn files)",
+    )
+    parser.add_argument(
         "--refractory-seconds",
         default=2.0,
         type=float,
@@ -156,6 +160,8 @@ async def main() -> None:
                 model_type = WakeWordType(model_config["type"])
                 if model_type == WakeWordType.OPEN_WAKE_WORD:
                     wake_word_path = model_config_path.parent / model_config["model"]
+                elif model_type == WakeWordType.PORCUPINE:
+                    wake_word_path = model_config_path.parent / model_config["model"]
                 else:
                     wake_word_path = model_config_path
 
@@ -194,8 +200,14 @@ async def main() -> None:
                 continue
 
             _LOGGER.debug("Loading wake model: %s", wake_word_id)
-            wake_models[wake_word_id] = wake_word.load()
-            active_wake_words.add(wake_word_id)
+            try:
+                wake_models[wake_word_id] = wake_word.load(
+                    porcupine_access_key=args.porcupine_access_key
+                )
+                active_wake_words.add(wake_word_id)
+            except ValueError as e:
+                _LOGGER.error("Failed to load wake word %s: %s", wake_word_id, e)
+                continue
 
     if not wake_models:
         # Load default model
@@ -203,8 +215,14 @@ async def main() -> None:
         wake_word = available_wake_words[wake_word_id]
 
         _LOGGER.debug("Loading wake model: %s", wake_word_id)
-        wake_models[wake_word_id] = wake_word.load()
-        active_wake_words.add(wake_word_id)
+        try:
+            wake_models[wake_word_id] = wake_word.load(
+                porcupine_access_key=args.porcupine_access_key
+            )
+            active_wake_words.add(wake_word_id)
+        except ValueError as e:
+            _LOGGER.error("Failed to load wake word %s: %s", wake_word_id, e)
+            sys.exit(1)
 
     # TODO: allow openWakeWord for "stop"
     stop_model: Optional[MicroWakeWord] = None
@@ -237,6 +255,7 @@ async def main() -> None:
         preferences_path=preferences_path,
         refractory_seconds=args.refractory_seconds,
         download_dir=args.download_dir,
+        porcupine_access_key=args.porcupine_access_key,
     )
 
     if args.enable_thinking_sound:
@@ -285,6 +304,10 @@ def process_audio(state: ServerState, mic, block_size: int):
     oww_inputs: List[np.ndarray] = []
     has_oww = False
 
+    porcupine_models: List = []
+    porcupine_buffer: List[int] = []
+    PORCUPINE_FRAME_LENGTH = 512
+
     last_active: Optional[float] = None
 
     try:
@@ -311,9 +334,14 @@ def process_audio(state: ServerState, mic, block_size: int):
                     ]
 
                     has_oww = False
+                    porcupine_models.clear()
                     for wake_word in wake_words:
                         if isinstance(wake_word, OpenWakeWord):
                             has_oww = True
+                        elif hasattr(wake_word, 'process'):
+                            # Porcupine models have process() but aren't MicroWakeWord/OpenWakeWord
+                            if not isinstance(wake_word, MicroWakeWord):
+                                porcupine_models.append(wake_word)
 
                     if micro_features is None:
                         micro_features = MicroWakeWordFeatures()
@@ -333,7 +361,36 @@ def process_audio(state: ServerState, mic, block_size: int):
                         oww_inputs.clear()
                         oww_inputs.extend(oww_features.process_streaming(audio_chunk))
 
+                    # Process Porcupine models
+                    if porcupine_models:
+                        # Convert audio chunk to 16-bit PCM samples
+                        pcm_samples = np.frombuffer(audio_chunk, dtype=np.int16).tolist()
+                        porcupine_buffer.extend(pcm_samples)
+
+                        # Process 512-sample frames
+                        while len(porcupine_buffer) >= PORCUPINE_FRAME_LENGTH:
+                            frame = porcupine_buffer[:PORCUPINE_FRAME_LENGTH]
+                            porcupine_buffer = porcupine_buffer[PORCUPINE_FRAME_LENGTH:]
+
+                            for porcupine_model in porcupine_models:
+                                try:
+                                    keyword_index = porcupine_model.process(frame)
+                                    if keyword_index >= 0:
+                                        # Wake word detected
+                                        now = time.monotonic()
+                                        if (last_active is None) or (
+                                            (now - last_active) > state.refractory_seconds
+                                        ):
+                                            state.satellite.wakeup(porcupine_model)
+                                            last_active = now
+                                except Exception as e:
+                                    _LOGGER.exception("Error processing Porcupine model: %s", e)
+
                     for wake_word in wake_words:
+                        # Skip Porcupine models (already processed above)
+                        if hasattr(wake_word, 'process') and not isinstance(wake_word, MicroWakeWord):
+                            continue
+
                         activated = False
                         if isinstance(wake_word, MicroWakeWord):
                             for micro_input in micro_inputs:
