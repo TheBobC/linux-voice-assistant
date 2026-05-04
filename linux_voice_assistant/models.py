@@ -10,13 +10,13 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 if TYPE_CHECKING:
     from pymicro_wakeword import MicroWakeWord
-    from pyopen_wakeword import OpenWakeWord
+    from openwakeword.model import OpenWakeWord
     import pvporcupine
 
     from .entity import ESPHomeEntity, MediaPlayerEntity
-    from .entity import ESPHomeEntity, MediaPlayerEntity, ThinkingSoundEntity
     from .mpv_player import MpvMediaPlayer
     from .satellite import VoiceSatelliteProtocol
+    from .lwake_detector import LwakeDetector
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ class WakeWordType(str, Enum):
     MICRO_WAKE_WORD = "micro"
     OPEN_WAKE_WORD = "openWakeWord"
     PORCUPINE = "porcupine"
+    LWAKE = "lwake"
 
 
 @dataclass
@@ -35,19 +36,25 @@ class AvailableWakeWord:
     trained_languages: List[str]
     wake_word_path: Path
 
-    def load(self, porcupine_access_key: Optional[str] = None) -> "Union[MicroWakeWord, OpenWakeWord, pvporcupine.Porcupine]":
+    def load(self, porcupine_access_key: Optional[str] = None) -> "Union[MicroWakeWord, OpenWakeWord, pvporcupine.Porcupine, LwakeDetector]":
         if self.type == WakeWordType.MICRO_WAKE_WORD:
             from pymicro_wakeword import MicroWakeWord
 
             return MicroWakeWord.from_config(config_path=self.wake_word_path)
 
         if self.type == WakeWordType.OPEN_WAKE_WORD:
-            from pyopen_wakeword import OpenWakeWord
+            from .openwakeword_compat import OpenWakeWord
 
-            oww_model = OpenWakeWord.from_model(model_path=self.wake_word_path)
+            oww_model = OpenWakeWord(model_path=str(self.wake_word_path))
             setattr(oww_model, "wake_word", self.wake_word)
+            setattr(oww_model, "id", self.id)
 
             return oww_model
+
+
+
+
+
 
         if self.type == WakeWordType.PORCUPINE:
             import pvporcupine
@@ -69,13 +76,23 @@ class AvailableWakeWord:
 
             return porcupine
 
+        if self.type == WakeWordType.LWAKE:
+            from .lwake_detector import LwakeDetector
+
+            detector = LwakeDetector.from_config(config_path=self.wake_word_path)
+            
+            # Add metadata for consistency with other engines
+            setattr(detector, "id", self.id)
+            
+            return detector
+
         raise ValueError(f"Unexpected wake word type: {self.type}")
 
 
 @dataclass
 class Preferences:
     active_wake_words: List[str] = field(default_factory=list)
-    thinking_sound: int = 0  # 0 = disabled, 1 = enabled
+
 
 @dataclass
 class ServerState:
@@ -90,7 +107,6 @@ class ServerState:
     music_player: "MpvMediaPlayer"
     tts_player: "MpvMediaPlayer"
     wakeup_sound: str
-    processing_sound: str
     timer_finished_sound: str
     preferences: Preferences
     preferences_path: Path
@@ -99,10 +115,8 @@ class ServerState:
     porcupine_access_key: Optional[str] = None
     media_player_entity: "Optional[MediaPlayerEntity]" = None
     satellite: "Optional[VoiceSatelliteProtocol]" = None
-    thinking_sound_entity: "Optional[ThinkingSoundEntity]" = None
     wake_words_changed: bool = False
     refractory_seconds: float = 2.0
-    thinking_sound_enabled: bool = False
 
     def save_preferences(self) -> None:
         """Save preferences as JSON."""

@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import time
 import threading
+from .transcript_filter import filter_transcript
 from collections.abc import Iterable
 from typing import Dict, Optional, Set, Union
 from urllib.parse import urlparse, urlunparse
@@ -42,7 +43,7 @@ from aioesphomeapi.model import (
 )
 from google.protobuf import message
 from pymicro_wakeword import MicroWakeWord
-from pyopen_wakeword import OpenWakeWord
+from .openwakeword_compat import OpenWakeWord
 import pvporcupine
 
 from .api_server import APIServer
@@ -56,7 +57,7 @@ _LOGGER = logging.getLogger(__name__)
 # ORCHESTRATOR CONFIGURATION
 # =============================================================================
 
-ORCHESTRATOR_URL = "https://10.0.0.9:5000"
+ORCHESTRATOR_URL = "http://10.0.0.9:5000"
 SPEAKER_ID_URL = "http://localhost:5001"
 SATELLITE_NAME = "Office"  # This satellite's name - CHANGE FOR EACH SATELLITE
 
@@ -100,7 +101,7 @@ def call_orchestrator(text: str, speaker: str, conversation_id: Optional[str] = 
             payload["conversation_id"] = conversation_id
 
         response = requests.post(
-            f"{ORCHESTRATOR_URL}/api/voice",
+            f"{ORCHESTRATOR_URL}/jarvis-api/voice",
             json=payload,
             timeout=30,
             verify=False  # Jarvis uses self-signed certificate
@@ -235,6 +236,13 @@ class VoiceSatelliteProtocol(APIServer):
                 return
             
             _LOGGER.info(f"Transcript: {transcript}")
+
+            # Filter Whisper hallucinations before sending to Jarvis
+            if filter_transcript(transcript, log_prefix='[SAT]') is None:
+                _LOGGER.warning(f"[SAT] Discarding hallucinated transcript: '{transcript[:60]}'")
+                self._tts_finished()
+                return
+
             self._speech_detected_in_window = True
             
             # Stop speaker-id and get identification result
@@ -276,8 +284,17 @@ class VoiceSatelliteProtocol(APIServer):
                 else:
                     _LOGGER.warning("No audio in orchestrator response")
             else:
-                _LOGGER.error("Orchestrator call failed, falling back to HA")
-                
+                _LOGGER.error("Orchestrator call failed - cleaning up pipeline")
+                # IMPORTANT: We must close out the satellite side of the pipeline.
+                # Doing nothing leaves HA waiting for VoiceAssistantAnnounceFinished
+                # forever, which causes HA to queue subsequent wake word runs on top
+                # of the stuck one — STT then stops completing for all future requests.
+                self._handled_by_orchestrator = True  # prevents double cleanup in RUN_END
+                self._continue_conversation = False
+                self._in_keepawake_mode = False
+                self._conversation_id = None
+                self._tts_finished()  # sends VoiceAssistantAnnounceFinished + unducks
+
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END:
             self._is_streaming_audio = False
             

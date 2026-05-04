@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import sys
+import statistics
 import threading
 import time
 from pathlib import Path
@@ -13,7 +14,8 @@ from typing import Dict, List, Optional, Set, Union
 import numpy as np
 import soundcard as sc
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
-from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
+from .openwakeword_compat import OpenWakeWord, OpenWakeWordFeatures
+from .lwake_detector import LwakeDetector
 
 from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
 from .mpv_player import MpvMediaPlayer
@@ -29,6 +31,28 @@ _SOUNDS_DIR = _REPO_DIR / "sounds"
 
 
 # -----------------------------------------------------------------------------
+
+def _sanitize_audio(audio: np.ndarray) -> np.ndarray:
+    """
+    soundcard/pipewire can occasionally yield NaN/inf or out-of-range floats.
+    That can wedge wake-word/VAD/stt flow. Sanitize once at the capture boundary.
+    """
+    # Ensure ndarray float32
+    audio = np.asarray(audio, dtype=np.float32)
+
+    # Replace NaN/inf with 0
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Clamp to valid audio range
+    np.clip(audio, -1.0, 1.0, out=audio)
+    return audio
+
+
+async def _heartbeat() -> None:
+    """Log every 60s so the watchdog doesn't mistake an idle satellite for frozen."""
+    while True:
+        await asyncio.sleep(60)
+        _LOGGER.info("[HEARTBEAT] alive")
 
 
 async def main() -> None:
@@ -85,10 +109,6 @@ async def main() -> None:
     parser.add_argument(
         "--timer-finished-sound", default=str(_SOUNDS_DIR / "timer_finished.flac")
     )
-    parser.add_argument(
-        "--processing-sound", default=str(_SOUNDS_DIR / "processing.wav"),
-        help="Short sound to play while assistant is processing (thinking)"
-    )
     #
     parser.add_argument("--preferences-file", default=_REPO_DIR / "preferences.json")
     #
@@ -100,9 +120,6 @@ async def main() -> None:
     parser.add_argument(
         "--port", type=int, default=6053, help="Port for ESPHome server (default: 6053)"
     )
-    parser.add_argument(
-        "--enable-thinking-sound", action="store_true", help="Enable thinking sound on startup"
-    )    
     parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to console"
     )
@@ -185,9 +202,6 @@ async def main() -> None:
     else:
         preferences = Preferences()
 
-    if args.enable_thinking_sound:
-        preferences.thinking_sound = 1
-
     # Load wake/stop models
     active_wake_words: Set[str] = set()
     wake_models: Dict[str, Union[MicroWakeWord, OpenWakeWord]] = {}
@@ -201,9 +215,7 @@ async def main() -> None:
 
             _LOGGER.debug("Loading wake model: %s", wake_word_id)
             try:
-                wake_models[wake_word_id] = wake_word.load(
-                    porcupine_access_key=args.porcupine_access_key
-                )
+                wake_models[wake_word_id] = wake_word.load(porcupine_access_key=args.porcupine_access_key)
                 active_wake_words.add(wake_word_id)
             except ValueError as e:
                 _LOGGER.error("Failed to load wake word %s: %s", wake_word_id, e)
@@ -216,9 +228,7 @@ async def main() -> None:
 
         _LOGGER.debug("Loading wake model: %s", wake_word_id)
         try:
-            wake_models[wake_word_id] = wake_word.load(
-                porcupine_access_key=args.porcupine_access_key
-            )
+            wake_models[wake_word_id] = wake_word.load(porcupine_access_key=args.porcupine_access_key)
             active_wake_words.add(wake_word_id)
         except ValueError as e:
             _LOGGER.error("Failed to load wake word %s: %s", wake_word_id, e)
@@ -250,16 +260,12 @@ async def main() -> None:
         tts_player=MpvMediaPlayer(device=args.audio_output_device),
         wakeup_sound=args.wakeup_sound,
         timer_finished_sound=args.timer_finished_sound,
-        processing_sound=args.processing_sound,
         preferences=preferences,
         preferences_path=preferences_path,
         refractory_seconds=args.refractory_seconds,
         download_dir=args.download_dir,
         porcupine_access_key=args.porcupine_access_key,
     )
-
-    if args.enable_thinking_sound:
-        state.save_preferences() 
 
     process_audio_thread = threading.Thread(
         target=process_audio,
@@ -280,6 +286,7 @@ async def main() -> None:
     try:
         async with server:
             _LOGGER.info("Server started (host=%s, port=%s)", args.host, args.port)
+            asyncio.create_task(_heartbeat())
             await server.serve_forever()
     except KeyboardInterrupt:
         pass
@@ -303,7 +310,6 @@ def process_audio(state: ServerState, mic, block_size: int):
     oww_features: Optional[OpenWakeWordFeatures] = None
     oww_inputs: List[np.ndarray] = []
     has_oww = False
-
     porcupine_models: List = []
     porcupine_buffer: List[int] = []
     PORCUPINE_FRAME_LENGTH = 512
@@ -314,9 +320,15 @@ def process_audio(state: ServerState, mic, block_size: int):
         _LOGGER.debug("Opening audio input device: %s", mic.name)
         with mic.recorder(samplerate=16000, channels=1, blocksize=block_size) as mic_in:
             while True:
+                # Capture float audio from soundcard
                 audio_chunk_array = mic_in.record(block_size).reshape(-1)
+
+                # Sanitize at the capture boundary (prevents NaNs/inf from wedging wake/VAD/STT)
+                audio_chunk_array = _sanitize_audio(audio_chunk_array)
+
+                # Convert to 16-bit PCM bytes for HA streaming + wake-word
                 audio_chunk = (
-                    (np.clip(audio_chunk_array, -1.0, 1.0) * 32767.0)
+                    (audio_chunk_array * 32767.0)
                     .astype("<i2")  # little-endian 16-bit signed
                     .tobytes()
                 )
@@ -336,12 +348,14 @@ def process_audio(state: ServerState, mic, block_size: int):
                     has_oww = False
                     porcupine_models.clear()
                     for wake_word in wake_words:
+                        # Skip Porcupine models (already processed above)
+                        if hasattr(wake_word, 'process') and not isinstance(wake_word, MicroWakeWord):
+                            continue
                         if isinstance(wake_word, OpenWakeWord):
                             has_oww = True
-                        elif hasattr(wake_word, 'process'):
+                        elif hasattr(wake_word, 'process') and not isinstance(wake_word, MicroWakeWord):
                             # Porcupine models have process() but aren't MicroWakeWord/OpenWakeWord
-                            if not isinstance(wake_word, MicroWakeWord):
-                                porcupine_models.append(wake_word)
+                            porcupine_models.append(wake_word)
 
                     if micro_features is None:
                         micro_features = MicroWakeWordFeatures()
@@ -350,8 +364,10 @@ def process_audio(state: ServerState, mic, block_size: int):
                         oww_features = OpenWakeWordFeatures.from_builtin()
 
                 try:
+                    # Always feed HA audio (it decides whether to consume it based on state)
                     state.satellite.handle_audio(audio_chunk)
 
+                    # Wake-word feature extraction MUST receive bytes
                     assert micro_features is not None
                     micro_inputs.clear()
                     micro_inputs.extend(micro_features.process_streaming(audio_chunk))
@@ -360,7 +376,6 @@ def process_audio(state: ServerState, mic, block_size: int):
                         assert oww_features is not None
                         oww_inputs.clear()
                         oww_inputs.extend(oww_features.process_streaming(audio_chunk))
-
                     # Process Porcupine models
                     if porcupine_models:
                         # Convert audio chunk to 16-bit PCM samples
@@ -386,24 +401,48 @@ def process_audio(state: ServerState, mic, block_size: int):
                                 except Exception as e:
                                     _LOGGER.exception("Error processing Porcupine model: %s", e)
 
+                    # Wake word detection
                     for wake_word in wake_words:
                         # Skip Porcupine models (already processed above)
                         if hasattr(wake_word, 'process') and not isinstance(wake_word, MicroWakeWord):
                             continue
-
                         activated = False
+
                         if isinstance(wake_word, MicroWakeWord):
                             for micro_input in micro_inputs:
-                                if wake_word.process_streaming(micro_input):
+                                result = wake_word.process_streaming(micro_input)
+                                
+                                # Log probability scores for debugging
+                                if hasattr(wake_word, '_probabilities') and len(wake_word._probabilities) > 0:
+                                    mean_prob = statistics.mean(wake_word._probabilities) if len(wake_word._probabilities) >= wake_word.sliding_window_size else 0.0
+                                    cutoff = wake_word.probability_cutoff
+                                    
+                                    # Log when probability is high (>0.85) for debugging
+                                    if mean_prob > 0.85:
+                                        _LOGGER.info(f"[WAKE] {wake_word.wake_word}: prob={mean_prob:.3f} cutoff={cutoff:.2f} {'TRIGGERED' if result else 'below-threshold'}")
+                                
+                                if result:
                                     activated = True
+                                    break
+
                         elif isinstance(wake_word, OpenWakeWord):
                             for oww_input in oww_inputs:
                                 for prob in wake_word.process_streaming(oww_input):
-                                    if prob > 0.5:
+                                    if prob > 0.4:
+                                        _LOGGER.info(f"[WAKE] {wake_word.wake_word}: prob={prob:.3f} cutoff=0.50 TRIGGERED")
                                         activated = True
+                                        break
+                                if activated:
+                                    break
+
+
+                        elif hasattr(wake_word, 'process_streaming') and wake_word.__class__.__name__ == 'LwakeDetector':
+                            # lwake detector - uses raw audio bytes
+                            if wake_word.process_streaming(audio_chunk):
+                                _LOGGER.info(f"[WAKE] {wake_word.wake_word}: lwake TRIGGERED")
+                                activated = True
 
                         if activated:
-                            # Check refractory
                             now = time.monotonic()
                             if (last_active is None) or (
                                 (now - last_active) > state.refractory_seconds
@@ -411,19 +450,24 @@ def process_audio(state: ServerState, mic, block_size: int):
                                 state.satellite.wakeup(wake_word)
                                 last_active = now
 
-                    # Always process to keep state correct
+                    # Stop word detection (MicroWakeWord only)
                     stopped = False
                     for micro_input in micro_inputs:
                         if state.stop_word.process_streaming(micro_input):
                             stopped = True
+                            break
 
                     if stopped and (state.stop_word.id in state.active_wake_words):
                         state.satellite.stop()
+
                 except Exception:
                     _LOGGER.exception("Unexpected error handling audio")
+
     except Exception:
         _LOGGER.exception("Unexpected error processing audio")
         sys.exit(1)
+
+
 
 
 # -----------------------------------------------------------------------------

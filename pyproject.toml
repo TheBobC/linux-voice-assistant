@@ -33,6 +33,7 @@ dependencies = [
     "pvporcupine>=3,<4",
     "python-mpv>=1,<2",
     "zeroconf<1",
+    "openwakeword>=0.4,<1",
 ]
 
 [project.optional-dependencies]
